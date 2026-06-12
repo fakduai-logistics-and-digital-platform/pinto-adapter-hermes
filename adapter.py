@@ -1,0 +1,388 @@
+"""Pinto Chat platform adapter (Hermes plugin).
+
+Allows Hermes Agent to act as a chat bot gateway on Pinto.
+
+Configuration via environment variables or config.yaml::
+
+    platforms:
+      pinto:
+        enabled: true
+        extra:
+          apiUrl: "https://api.pinto-app.com"
+          botId: "your-bot-uuid"
+          webhookSecret: "your-optional-secret"
+          webhookPath: "/plugins/pinto/webhook"
+
+Environment variables::
+
+    PINTO_BOT_ID           – Required. Your Pinto Bot UUID or slug (e.g. "hermes_ai")
+    PINTO_API_URL          – API base URL (default: https://api.pinto-app.com)
+    PINTO_WEBHOOK_SECRET   – Optional secret for X-Pinto-Secret header verification
+    PINTO_WEBHOOK_PATH     – Local webhook route (default: /plugins/pinto/webhook)
+    PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
+    PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
+    PINTO_ALLOW_ALL_USERS  – Set "true" to let any user chat with the bot
+"""
+
+import json
+import logging
+import os
+import time
+import uuid
+from typing import TYPE_CHECKING, Any, List, Optional
+
+if TYPE_CHECKING:
+    import httpx as _httpx
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+    httpx = None
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    SendResult,
+)
+from gateway.session import SessionSource
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_PINTO_API_URL = "https://api.pinto-app.com"
+DEFAULT_WEBHOOK_PATH = "/plugins/pinto/webhook"
+PINTO_SECRET_HEADER = "x-pinto-secret"
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (used by plugin loader)
+# ---------------------------------------------------------------------------
+
+def _env_enablement() -> Optional[dict]:
+    """Auto-enable platform when PINTO_BOT_ID is present in environment."""
+    bot_id = os.getenv("PINTO_BOT_ID")
+    if not bot_id:
+        return None
+    return {
+        "botId": bot_id,
+        "apiUrl": os.getenv("PINTO_API_URL", DEFAULT_PINTO_API_URL),
+        "webhookSecret": os.getenv("PINTO_WEBHOOK_SECRET", ""),
+        "webhookPath": os.getenv("PINTO_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH),
+    }
+
+
+def check_requirements() -> bool:
+    """Return True when httpx is importable."""
+    return HTTPX_AVAILABLE
+
+
+def validate_config(config: PlatformConfig) -> bool:
+    extra = getattr(config, "extra", {}) or {}
+    bot_id = extra.get("botId") or os.getenv("PINTO_BOT_ID")
+    return bool(bot_id)
+
+
+def is_connected(config: PlatformConfig) -> bool:
+    return validate_config(config) and config.enabled
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+class PintoAdapter(BasePlatformAdapter):
+    """Pinto Chat platform adapter for Hermes.
+
+    Handles **both** webhook payload formats:
+
+    * **Flat** (production)::
+
+        {"user_id":"...","username":"...","message":"text","chat_id":"...","bot_id":"..."}
+
+    * **Nested** (Swagger spec)::
+
+        {"bot_id":"...","chat_id":"...","message":{"chat_id":"...","content":"...","sender":{}}}
+    """
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config, Platform.TELEGRAM)
+        extra = getattr(config, "extra", {}) or {}
+        self._bot_id = extra.get("botId") or os.getenv("PINTO_BOT_ID")
+        self._api_url = (
+            extra.get("apiUrl") or os.getenv("PINTO_API_URL", DEFAULT_PINTO_API_URL)
+        ).rstrip("/")
+        self._webhook_secret = (
+            extra.get("webhookSecret") or os.getenv("PINTO_WEBHOOK_SECRET", "")
+        )
+        self._webhook_path = extra.get("webhookPath") or os.getenv(
+            "PINTO_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH
+        )
+        self._client: Optional["_httpx.AsyncClient"] = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    async def connect(self) -> bool:
+        if not self._bot_id:
+            logger.error("PINTO_BOT_ID not configured")
+            return False
+
+        self._client = httpx.AsyncClient(timeout=30.0)
+        self._running = True
+
+        # Register webhook route on the api_server aiohttp app
+        try:
+            from gateway.platform_registry import platform_registry
+
+            api_entry = platform_registry.get("api_server")
+            api_app = None
+            api_port = "?"
+
+            if api_entry is not None:
+                live = getattr(api_entry, "_live_adapter", None) or getattr(
+                    api_entry, "adapter", None
+                )
+                if live is not None:
+                    api_app = getattr(live, "_app", None)
+                    api_port = getattr(live, "_port", "?")
+
+            if api_app is not None:
+                api_app.router.add_post(self._webhook_path, self._handle_webhook)
+                api_app.router.add_get(self._webhook_path, self._handle_webhook_ping)
+                logger.info(
+                    "Pinto webhook registered at %s (api_server port %s)",
+                    self._webhook_path,
+                    api_port,
+                )
+            else:
+                logger.warning(
+                    "api_server aiohttp app not found — Pinto webhook not mounted. "
+                    "Enable platforms.api_server in config.yaml and ensure it starts before pinto."
+                )
+        except Exception as e:
+            logger.error("Failed to register Pinto webhook route: %s", e)
+
+        logger.info("Pinto Chat adapter connected (bot_id=%s)", self._bot_id)
+        return True
+
+    async def disconnect(self) -> None:
+        self._running = False
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+        logger.info("Pinto Chat adapter disconnected")
+
+    # -- webhook handlers ----------------------------------------------------
+
+    async def _handle_webhook_ping(self, request):
+        """GET health check."""
+        from aiohttp import web as _web
+
+        return _web.json_response({"ok": True, "channel": "pinto"})
+
+    async def _handle_webhook(self, request):
+        """Handle inbound POST from Pinto server.
+
+        Supports **flat** production payload where ``message`` is a string
+        and **nested** Swagger-style payload where ``message`` is an object
+        with ``content`` and ``sender`` keys.
+        """
+        try:
+            # -- verify secret ------------------------------------------------
+            if self._webhook_secret:
+                inbound_secret = request.headers.get(PINTO_SECRET_HEADER, "")
+                if inbound_secret != self._webhook_secret:
+                    return request.app["response_class"](
+                        status=401,
+                        text=json.dumps({"error": "Invalid webhook secret"}),
+                        content_type="application/json",
+                    )
+
+            body = await request.json()
+            logger.debug("Pinto webhook body: %s", json.dumps(body, ensure_ascii=False)[:500])
+
+            # -- parse payload (flat or nested) --------------------------------
+            bot_id = body.get("bot_id")
+            raw_msg = body.get("message")
+
+            if isinstance(raw_msg, str):
+                # Flat production format: message is a plain string
+                chat_id = body.get("chat_id")
+                user_id = body.get("user_id") or chat_id
+                message_text = raw_msg
+                username = body.get("username") or str(user_id)
+            elif isinstance(raw_msg, dict):
+                # Nested Swagger format
+                chat_id = raw_msg.get("chat_id") or body.get("chat_id")
+                user_id = (raw_msg.get("sender") or {}).get("user_id") or body.get("user_id") or chat_id
+                message_text = raw_msg.get("content", "")
+                username = (raw_msg.get("sender") or {}).get("username") or body.get("username") or str(user_id)
+            else:
+                chat_id = body.get("chat_id")
+                user_id = body.get("user_id") or chat_id
+                message_text = str(raw_msg) if raw_msg else ""
+                username = body.get("username") or str(user_id)
+
+            if not bot_id or not chat_id or not message_text:
+                return request.app["response_class"](
+                    status=400,
+                    text=json.dumps({"error": "Missing required fields: bot_id, chat_id, message"}),
+                    content_type="application/json",
+                )
+
+            if bot_id != self._bot_id:
+                return request.app["response_class"](
+                    status=403,
+                    text=json.dumps({"error": "bot_id mismatch"}),
+                    content_type="application/json",
+                )
+
+            source = SessionSource(
+                platform=self.platform,
+                chat_id=str(chat_id),
+                user_id=str(user_id),
+                user_name=username,
+                chat_type="dm",
+            )
+            event = MessageEvent(
+                text=message_text,
+                source=source,
+                message_id=str(uuid.uuid4()),
+                raw_message=body,
+            )
+
+            await self.handle_message(event)
+
+            return request.app["response_class"](
+                status=200,
+                text=json.dumps({"ok": True}),
+                content_type="application/json",
+            )
+
+        except Exception as e:
+            logger.error("Pinto webhook error: %s", e)
+            return request.app["response_class"](
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+            )
+
+    # -- send ----------------------------------------------------------------
+
+    async def send(self, chat_id: str, text: str, **kwargs: Any) -> SendResult:
+        """Post reply back to Pinto via ``POST /v1/bots/webhook/receive``."""
+        if not self._client:
+            return SendResult(success=False, error="Adapter not connected")
+
+        url = f"{self._api_url}/v1/bots/webhook/receive"
+        headers = {"Content-Type": "application/json"}
+        if self._webhook_secret:
+            headers[PINTO_SECRET_HEADER] = self._webhook_secret
+
+        payload = {
+            "bot_id": self._bot_id,
+            "chat_id": chat_id,
+            "reply_message": text,
+        }
+
+        media_files = kwargs.get("media_files")
+        if media_files:
+            payload["media_url"] = media_files[0]
+
+        try:
+            resp = await self._client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 300:
+                return SendResult(
+                    success=False,
+                    error=f"Pinto HTTP {resp.status_code}: {resp.text}",
+                )
+            return SendResult(success=True, message_id=str(time.time()))
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_typing(self, chat_id: str) -> None:
+        pass  # Pinto has no typing indicator API
+
+    async def send_image(self, chat_id: str, image_url: str, caption: str) -> SendResult:
+        return await self.send(chat_id, caption, media_files=[image_url])
+
+    async def get_chat_info(self, chat_id: str) -> dict:
+        return {"name": f"Pinto Chat {chat_id}", "type": "dm", "chat_id": chat_id}
+
+
+# ---------------------------------------------------------------------------
+# Standalone sender (for cron / background delivery outside gateway process)
+# ---------------------------------------------------------------------------
+
+async def _standalone_send(
+    pconfig: PlatformConfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> dict:
+    """Out-of-process delivery for cron/background tasks."""
+    if not HTTPX_AVAILABLE:
+        return {"error": "httpx not installed"}
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    bot_id = extra.get("botId") or os.getenv("PINTO_BOT_ID")
+    api_url = (
+        extra.get("apiUrl") or os.getenv("PINTO_API_URL", DEFAULT_PINTO_API_URL)
+    ).rstrip("/")
+    webhook_secret = extra.get("webhookSecret") or os.getenv("PINTO_WEBHOOK_SECRET", "")
+
+    if not bot_id:
+        return {"error": "Pinto botId not configured"}
+
+    url = f"{api_url}/v1/bots/webhook/receive"
+    headers = {"Content-Type": "application/json"}
+    if webhook_secret:
+        headers[PINTO_SECRET_HEADER] = webhook_secret
+
+    payload: dict = {
+        "bot_id": bot_id,
+        "chat_id": chat_id,
+        "reply_message": message,
+    }
+    if media_files:
+        payload["media_url"] = media_files[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code >= 300:
+            return {"error": f"Pinto HTTP {resp.status_code}: {resp.text}"}
+        return {"success": True, "message_id": str(time.time())}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration
+# ---------------------------------------------------------------------------
+
+def register(ctx) -> None:
+    """Called by Hermes plugin loader to register the Pinto platform."""
+    ctx.register_platform(
+        name="pinto",
+        label="Pinto",
+        adapter_factory=lambda cfg: PintoAdapter(cfg),
+        check_fn=check_requirements,
+        validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["PINTO_BOT_ID"],
+        install_hint="pip install httpx",
+        env_enablement_fn=_env_enablement,
+        cron_deliver_env_var="PINTO_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
+        allowed_users_env="PINTO_ALLOWED_USERS",
+        allow_all_env="PINTO_ALLOW_ALL_USERS",
+        emoji="🫓",
+        pii_safe=True,
+        allow_update_command=False,
+        platform_hint="You are chatting via Pinto Thailand Chat API.",
+    )
