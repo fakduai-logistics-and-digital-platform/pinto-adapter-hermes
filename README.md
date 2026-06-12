@@ -1,5 +1,8 @@
 # 🫓 Hermes Pinto Chat Adapter
 
+<img width="1672" alt="image" src="https://github.com/user-attachments/assets/c4ceaa39-1cf5-437a-8ce1-f97a5b67961d" />
+
+
 **Pinto Chat** platform adapter plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent).
 
 Allows Hermes to act as a chatbot on [Pinto](https://pinto-app.com), a Thai social platform. The adapter receives webhook events from Pinto and replies through the Pinto Bot API.
