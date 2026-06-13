@@ -22,7 +22,7 @@ Environment variables::
     PINTO_WEBHOOK_URL      – Public webhook URL; used to derive media URLs
     PINTO_PUBLIC_BASE_URL  – Optional public gateway base URL for media
     PINTO_MEDIA_PATH       – Public local-media route (default: /plugins/pinto/media)
-    PINTO_BEARER_TOKEN     – Optional Pinto JWT for native chat API, typing, media upload
+    PINTO_BEARER_TOKEN     – Optional user/service JWT for native chat API testing only
     PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
     PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
     PINTO_ALLOW_ALL_USERS  – Set "true" to let any user chat with the bot
@@ -393,6 +393,15 @@ class PintoAdapter(BasePlatformAdapter):
             if file_handle:
                 file_handle.close()
 
+    def _text_with_public_media_url(self, text: str, media_file: Optional[str], media_url: str) -> str:
+        if not media_file or not media_url or media_url == media_file:
+            return text
+        if media_file in text:
+            return text.replace(media_file, media_url)
+        if media_url not in text:
+            return f"{text}\n{media_url}" if text else media_url
+        return text
+
     async def _send_webhook_receive(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
         url = f"{self._api_url}/v1/bots/webhook/receive"
         headers = {"Content-Type": "application/json"}
@@ -408,7 +417,14 @@ class PintoAdapter(BasePlatformAdapter):
             media_url = self._media_url_for_file(media_file)
             if media_url != media_file:
                 payload["media_url"] = media_url
+                payload["reply_message"] = self._text_with_public_media_url(text, media_file, media_url)
 
+        logger.info(
+            "Pinto webhook send chat_id=%s has_media=%s payload_keys=%s",
+            chat_id,
+            bool(payload.get("media_url")),
+            sorted(payload.keys()),
+        )
         resp = await self._client.post(url, json=payload, headers=headers)
         if resp.status_code >= 300:
             return SendResult(success=False, error=f"Pinto HTTP {resp.status_code}: {resp.text}")
