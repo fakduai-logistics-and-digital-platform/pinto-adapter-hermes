@@ -19,6 +19,9 @@ Environment variables::
     PINTO_API_URL          – API base URL (default: https://api.pinto-app.com)
     PINTO_WEBHOOK_SECRET   – Optional secret for X-Pinto-Secret header verification
     PINTO_WEBHOOK_PATH     – Local webhook route (default: /plugins/pinto/webhook)
+    PINTO_WEBHOOK_URL      – Public webhook URL; used to derive media URLs
+    PINTO_PUBLIC_BASE_URL  – Optional public gateway base URL for media
+    PINTO_MEDIA_PATH       – Public local-media route (default: /plugins/pinto/media)
     PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
     PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
     PINTO_ALLOW_ALL_USERS  – Set "true" to let any user chat with the bot
@@ -29,7 +32,14 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
+from urllib.parse import urlparse
+
+try:
+    from aiohttp import web
+except Exception:
+    web = None
 
 if TYPE_CHECKING:
     import httpx as _httpx
@@ -119,6 +129,10 @@ class PintoAdapter(BasePlatformAdapter):
         self._webhook_path = extra.get("webhookPath") or os.getenv(
             "PINTO_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH
         )
+        self._media_path = extra.get("mediaPath") or os.getenv(
+            "PINTO_MEDIA_PATH", "/plugins/pinto/media"
+        )
+        self._media_files: dict[str, str] = {}
         self._client: Optional["_httpx.AsyncClient"] = None
 
     # -- lifecycle -----------------------------------------------------------
@@ -150,6 +164,7 @@ class PintoAdapter(BasePlatformAdapter):
             if api_app is not None:
                 api_app.router.add_post(self._webhook_path, self._handle_webhook)
                 api_app.router.add_get(self._webhook_path, self._handle_webhook_ping)
+                api_app.router.add_get(self._media_path + "/{token}", self._handle_media)
                 logger.info(
                     "Pinto webhook registered at %s (api_server port %s)",
                     self._webhook_path,
@@ -268,10 +283,69 @@ class PintoAdapter(BasePlatformAdapter):
                 content_type="application/json",
             )
 
+    # -- local media ---------------------------------------------------------
+
+    def _public_base_url(self) -> str:
+        explicit = os.getenv("PINTO_PUBLIC_BASE_URL", "").rstrip("/")
+        if explicit:
+            return explicit
+
+        webhook_url = os.getenv("PINTO_WEBHOOK_URL", "")
+        env_path = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / ".env"
+        if env_path.exists():
+            try:
+                for line in env_path.read_text().splitlines():
+                    if line.startswith("PINTO_PUBLIC_BASE_URL="):
+                        explicit = line.split("=", 1)[1].strip().rstrip("/")
+                        if explicit:
+                            return explicit
+                    elif line.startswith("PINTO_WEBHOOK_URL="):
+                        webhook_url = line.split("=", 1)[1].strip()
+            except Exception:
+                pass
+
+        if webhook_url:
+            parsed = urlparse(webhook_url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        return ""
+
+    def _media_url_for_file(self, file_path: str) -> str:
+        if file_path.startswith(("http://", "https://")):
+            return file_path
+
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return file_path
+
+        token = f"{int(time.time())}_{uuid.uuid4().hex}_{path.name}"
+        self._media_files[token] = str(path)
+
+        base = self._public_base_url()
+        if not base:
+            return file_path
+        return f"{base}{self._media_path}/{token}"
+
+    async def _handle_media(self, request):
+        if web is None:
+            return request.app["response_class"](
+                status=500,
+                text="aiohttp is not available",
+                content_type="text/plain",
+            )
+
+        token = request.match_info.get("token", "")
+        file_path = self._media_files.get(token)
+        if not file_path or not Path(file_path).exists():
+            return web.Response(status=404, text="Not found")
+        return web.FileResponse(file_path)
+
     # -- send ----------------------------------------------------------------
 
-    async def send(self, chat_id: str, text: str, **kwargs: Any) -> SendResult:
+    async def send(self, chat_id: str, text: str = "", content: str = "", **kwargs: Any) -> SendResult:
         """Post reply back to Pinto via ``POST /v1/bots/webhook/receive``."""
+        if content and not text:
+            text = content
         if not self._client:
             return SendResult(success=False, error="Adapter not connected")
 
@@ -288,7 +362,7 @@ class PintoAdapter(BasePlatformAdapter):
 
         media_files = kwargs.get("media_files")
         if media_files:
-            payload["media_url"] = media_files[0]
+            payload["media_url"] = self._media_url_for_file(str(media_files[0]))
 
         try:
             resp = await self._client.post(url, json=payload, headers=headers)
