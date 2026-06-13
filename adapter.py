@@ -139,6 +139,7 @@ class PintoAdapter(BasePlatformAdapter):
         self._media_files: dict[str, str] = {}
         self._bearer_token = extra.get("bearerToken") or os.getenv("PINTO_BEARER_TOKEN", "")
         self._media_upload_provider = os.getenv("PINTO_MEDIA_UPLOAD_PROVIDER", "").lower().strip()
+        self._send_media_url_field = os.getenv("PINTO_SEND_MEDIA_URL_FIELD", "false").lower() == "true"
         self._litterbox_expiry = os.getenv("PINTO_LITTERBOX_EXPIRY", "24h")
         self._typing_last_sent: dict[str, float] = {}
         self._typing_status_message = os.getenv("PINTO_TYPING_STATUS_MESSAGE", "")
@@ -515,7 +516,8 @@ class PintoAdapter(BasePlatformAdapter):
         if media_file:
             media_url = await self._public_url_for_media(media_file)
             if media_url != media_file:
-                payload["media_url"] = media_url
+                if self._send_media_url_field:
+                    payload["media_url"] = media_url
                 payload["reply_message"] = self._text_with_public_media_url(text, media_file, media_url)
 
         logger.info(
