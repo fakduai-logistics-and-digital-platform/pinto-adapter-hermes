@@ -29,6 +29,7 @@ Environment variables::
     PINTO_ALLOW_ALL_USERS  – Set "true" to let any user chat with the bot
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -276,11 +277,16 @@ class PintoAdapter(BasePlatformAdapter):
                 raw_message=body,
             )
 
-            await self.handle_message(event)
+            task = asyncio.create_task(self.handle_message(event))
+            task.add_done_callback(
+                lambda t: logger.error("Pinto background task error: %s", t.exception())
+                if t.exception()
+                else None
+            )
 
             return request.app["response_class"](
                 status=200,
-                text=json.dumps({"ok": True}),
+                text=json.dumps({"ok": True, "queued": True}),
                 content_type="application/json",
             )
 
