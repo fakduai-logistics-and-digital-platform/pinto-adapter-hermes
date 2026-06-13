@@ -22,6 +22,7 @@ Environment variables::
     PINTO_WEBHOOK_URL      – Public webhook URL; used to derive media URLs
     PINTO_PUBLIC_BASE_URL  – Optional public gateway base URL for media
     PINTO_MEDIA_PATH       – Public local-media route (default: /plugins/pinto/media)
+    PINTO_MEDIA_UPLOAD_PROVIDER – Optional free public upload provider: catbox or litterbox
     PINTO_BEARER_TOKEN     – Optional user/service JWT for native chat API testing only
     PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
     PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
@@ -136,6 +137,8 @@ class PintoAdapter(BasePlatformAdapter):
         )
         self._media_files: dict[str, str] = {}
         self._bearer_token = extra.get("bearerToken") or os.getenv("PINTO_BEARER_TOKEN", "")
+        self._media_upload_provider = os.getenv("PINTO_MEDIA_UPLOAD_PROVIDER", "").lower().strip()
+        self._litterbox_expiry = os.getenv("PINTO_LITTERBOX_EXPIRY", "24h")
         self._typing_last_sent: dict[str, float] = {}
         self._typing_status_message = os.getenv("PINTO_TYPING_STATUS_MESSAGE", "")
         self._typing_status_interval = float(os.getenv("PINTO_TYPING_STATUS_INTERVAL", "20"))
@@ -402,6 +405,53 @@ class PintoAdapter(BasePlatformAdapter):
             return f"{text}\n{media_url}" if text else media_url
         return text
 
+    async def _upload_public_media(self, file_path: str) -> Optional[str]:
+        """Upload local media to a free public host when configured."""
+        if not self._media_upload_provider:
+            return None
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return None
+
+        if self._media_upload_provider == "catbox":
+            url = "https://catbox.moe/user/api.php"
+            data = {"reqtype": "fileupload"}
+        elif self._media_upload_provider == "litterbox":
+            url = "https://litterbox.catbox.moe/resources/internals/api.php"
+            data = {"reqtype": "fileupload", "time": self._litterbox_expiry}
+        else:
+            logger.warning("Unknown PINTO_MEDIA_UPLOAD_PROVIDER=%s", self._media_upload_provider)
+            return None
+
+        file_handle = None
+        try:
+            file_handle = path.open("rb")
+            files = {"fileToUpload": (path.name, file_handle, "image/png")}
+            resp = await self._client.post(url, data=data, files=files, timeout=120.0)
+            if resp.status_code >= 300:
+                logger.warning("Pinto media upload failed HTTP %s: %s", resp.status_code, resp.text[:300])
+                return None
+            public_url = resp.text.strip()
+            if public_url.startswith(("http://", "https://")):
+                logger.info("Pinto media uploaded via %s: %s", self._media_upload_provider, public_url)
+                return public_url
+            logger.warning("Pinto media upload returned non-url response: %s", public_url[:300])
+            return None
+        except Exception as e:
+            logger.warning("Pinto media upload failed: %s", e)
+            return None
+        finally:
+            if file_handle:
+                file_handle.close()
+
+    async def _public_url_for_media(self, media_file: str) -> str:
+        if media_file.startswith(("http://", "https://")):
+            return media_file
+        uploaded = await self._upload_public_media(media_file)
+        if uploaded:
+            return uploaded
+        return self._media_url_for_file(media_file)
+
     async def _send_webhook_receive(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
         url = f"{self._api_url}/v1/bots/webhook/receive"
         headers = {"Content-Type": "application/json"}
@@ -414,7 +464,7 @@ class PintoAdapter(BasePlatformAdapter):
             "reply_message": text,
         }
         if media_file:
-            media_url = self._media_url_for_file(media_file)
+            media_url = await self._public_url_for_media(media_file)
             if media_url != media_file:
                 payload["media_url"] = media_url
                 payload["reply_message"] = self._text_with_public_media_url(text, media_file, media_url)
