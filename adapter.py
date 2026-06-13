@@ -30,6 +30,7 @@ Environment variables::
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -366,6 +367,12 @@ class PintoAdapter(BasePlatformAdapter):
         media_files = kwargs.get("media_files")
         if media_files:
             payload["media_url"] = self._media_url_for_file(str(media_files[0]))
+        elif text:
+            match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))", text, re.IGNORECASE)
+            if match:
+                media_url = self._media_url_for_file(match.group(1))
+                if media_url != match.group(1):
+                    payload["media_url"] = media_url
 
         try:
             resp = await self._client.post(url, json=payload, headers=headers)
