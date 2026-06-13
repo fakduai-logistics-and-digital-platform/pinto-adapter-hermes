@@ -22,6 +22,7 @@ Environment variables::
     PINTO_WEBHOOK_URL      – Public webhook URL; used to derive media URLs
     PINTO_PUBLIC_BASE_URL  – Optional public gateway base URL for media
     PINTO_MEDIA_PATH       – Public local-media route (default: /plugins/pinto/media)
+    PINTO_BEARER_TOKEN     – Optional Pinto JWT for native chat API, typing, media upload
     PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
     PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
     PINTO_ALLOW_ALL_USERS  – Set "true" to let any user chat with the bot
@@ -134,6 +135,7 @@ class PintoAdapter(BasePlatformAdapter):
             "PINTO_MEDIA_PATH", "/plugins/pinto/media"
         )
         self._media_files: dict[str, str] = {}
+        self._bearer_token = extra.get("bearerToken") or os.getenv("PINTO_BEARER_TOKEN", "")
         self._typing_last_sent: dict[str, float] = {}
         self._typing_status_message = os.getenv("PINTO_TYPING_STATUS_MESSAGE", "")
         self._typing_status_interval = float(os.getenv("PINTO_TYPING_STATUS_INTERVAL", "20"))
@@ -346,13 +348,52 @@ class PintoAdapter(BasePlatformAdapter):
 
     # -- send ----------------------------------------------------------------
 
-    async def send(self, chat_id: str, text: str = "", content: str = "", **kwargs: Any) -> SendResult:
-        """Post reply back to Pinto via ``POST /v1/bots/webhook/receive``."""
-        if content and not text:
-            text = content
-        if not self._client:
-            return SendResult(success=False, error="Adapter not connected")
+    def _extract_media_file(self, text: str, media_files: Any = None) -> Optional[str]:
+        if media_files:
+            return str(media_files[0])
+        if text:
+            match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))", text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
 
+    async def _send_native_chat_message(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
+        """Send via Pinto native chat API when PINTO_BEARER_TOKEN is configured."""
+        url = f"{self._api_url}/v1/chats/{chat_id}/messages"
+        headers = {"Authorization": f"Bearer {self._bearer_token}"}
+        data = {
+            "content": text or " ",
+            "message_type": "image" if media_file else "text",
+        }
+        files = None
+        file_handle = None
+        try:
+            if media_file:
+                path = Path(media_file)
+                if path.exists() and path.is_file():
+                    file_handle = path.open("rb")
+                    files = {"media": (path.name, file_handle, "image/png")}
+                elif media_file.startswith(("http://", "https://")):
+                    # Native API accepts binary upload only. Fall back to webhook media_url.
+                    return await self._send_webhook_receive(chat_id, text, media_file)
+
+            resp = await self._client.post(url, data=data, files=files, headers=headers)
+            if resp.status_code >= 300:
+                return SendResult(success=False, error=f"Pinto native HTTP {resp.status_code}: {resp.text}")
+            message_id = str(time.time())
+            try:
+                body = resp.json()
+                message_id = str(body.get("message_id") or (body.get("data") or {}).get("message_id") or message_id)
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+        finally:
+            if file_handle:
+                file_handle.close()
+
+    async def _send_webhook_receive(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
         url = f"{self._api_url}/v1/bots/webhook/receive"
         headers = {"Content-Type": "application/json"}
         if self._webhook_secret:
@@ -363,25 +404,32 @@ class PintoAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "reply_message": text,
         }
+        if media_file:
+            media_url = self._media_url_for_file(media_file)
+            if media_url != media_file:
+                payload["media_url"] = media_url
 
-        media_files = kwargs.get("media_files")
-        if media_files:
-            payload["media_url"] = self._media_url_for_file(str(media_files[0]))
-        elif text:
-            match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))", text, re.IGNORECASE)
-            if match:
-                media_url = self._media_url_for_file(match.group(1))
-                if media_url != match.group(1):
-                    payload["media_url"] = media_url
+        resp = await self._client.post(url, json=payload, headers=headers)
+        if resp.status_code >= 300:
+            return SendResult(success=False, error=f"Pinto HTTP {resp.status_code}: {resp.text}")
+        return SendResult(success=True, message_id=str(time.time()))
 
+    async def send(self, chat_id: str, text: str = "", content: str = "", **kwargs: Any) -> SendResult:
+        """Post reply back to Pinto.
+
+        Uses native chat API with multipart media upload when PINTO_BEARER_TOKEN
+        is set. Otherwise falls back to the bot webhook receive endpoint.
+        """
+        if content and not text:
+            text = content
+        if not self._client:
+            return SendResult(success=False, error="Adapter not connected")
+
+        media_file = self._extract_media_file(text, kwargs.get("media_files"))
         try:
-            resp = await self._client.post(url, json=payload, headers=headers)
-            if resp.status_code >= 300:
-                return SendResult(
-                    success=False,
-                    error=f"Pinto HTTP {resp.status_code}: {resp.text}",
-                )
-            return SendResult(success=True, message_id=str(time.time()))
+            if self._bearer_token:
+                return await self._send_native_chat_message(chat_id, text, media_file)
+            return await self._send_webhook_receive(chat_id, text, media_file)
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
@@ -392,6 +440,17 @@ class PintoAdapter(BasePlatformAdapter):
         this adapter. If PINTO_TYPING_STATUS_MESSAGE is set, use a lightweight
         chat message as a fallback and throttle it per chat.
         """
+        if self._bearer_token and self._client:
+            try:
+                await self._client.post(
+                    f"{self._api_url}/v1/chats/typing",
+                    json={"chat_id": chat_id, "is_typing": True},
+                    headers={"Authorization": f"Bearer {self._bearer_token}"},
+                )
+                return
+            except Exception as e:
+                logger.debug("Pinto native typing failed: %s", e)
+
         if not self._typing_status_message:
             return
         now = time.time()
