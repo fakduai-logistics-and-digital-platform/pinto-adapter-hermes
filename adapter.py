@@ -144,6 +144,12 @@ class PintoAdapter(BasePlatformAdapter):
         self._typing_last_sent: dict[str, float] = {}
         self._typing_status_message = os.getenv("PINTO_TYPING_STATUS_MESSAGE", "")
         self._typing_status_interval = float(os.getenv("PINTO_TYPING_STATUS_INTERVAL", "20"))
+        self._generating_path = os.getenv("PINTO_GENERATING_PATH", "/v1/bots/webhook/generating")
+        self._generating_secret = os.getenv("PINTO_GENERATING_SECRET", "") or os.getenv("PINTO_WEBHOOK_SECRET", "")
+        self._generating_type_default = os.getenv("PINTO_GENERATING_TYPE", "text")
+        self._generating_state: dict[str, tuple[bool, str]] = {}
+        self._receive_media_path = os.getenv("PINTO_RECEIVE_MEDIA_PATH", "/v1/bots/webhook/receive-media")
+        self._media_upload_secret = os.getenv("PINTO_MEDIA_UPLOAD_SECRET", "") or os.getenv("PINTO_WEBHOOK_SECRET", "")
         self._client: Optional["_httpx.AsyncClient"] = None
 
     # -- lifecycle -----------------------------------------------------------
@@ -238,12 +244,16 @@ class PintoAdapter(BasePlatformAdapter):
                 user_id = body.get("user_id") or chat_id
                 message_text = raw_msg
                 username = body.get("username") or str(user_id)
+                os.environ["PINTO_ACTIVE_CHAT_ID"] = str(chat_id or "")
+                os.environ["PINTO_ACTIVE_BOT_ID"] = str(bot_id or self._bot_id or "")
             elif isinstance(raw_msg, dict):
                 # Nested Swagger format
                 chat_id = raw_msg.get("chat_id") or body.get("chat_id")
                 user_id = (raw_msg.get("sender") or {}).get("user_id") or body.get("user_id") or chat_id
                 message_text = raw_msg.get("content", "")
                 username = (raw_msg.get("sender") or {}).get("username") or body.get("username") or str(user_id)
+                os.environ["PINTO_ACTIVE_CHAT_ID"] = str(chat_id or "")
+                os.environ["PINTO_ACTIVE_BOT_ID"] = str(bot_id or self._bot_id or "")
             else:
                 chat_id = body.get("chat_id")
                 user_id = body.get("user_id") or chat_id
@@ -300,6 +310,32 @@ class PintoAdapter(BasePlatformAdapter):
             )
 
     # -- local media ---------------------------------------------------------
+
+
+    async def _set_generating(self, chat_id: str, is_generating: bool, generating_type: str = "text") -> None:
+        if not self._client or not self._bot_id:
+            return
+        generating_type = (generating_type or self._generating_type_default or "text") if is_generating else ""
+        state = (is_generating, generating_type)
+        if self._generating_state.get(chat_id) == state:
+            return
+        self._generating_state[chat_id] = state
+        url = f"{self._api_url}{self._generating_path}"
+        headers = {"Content-Type": "application/json"}
+        if self._generating_secret:
+            headers[PINTO_SECRET_HEADER] = self._generating_secret
+        payload = {
+            "bot_id": self._bot_id,
+            "chat_id": chat_id,
+            "is_generating": is_generating,
+            "generating_type": generating_type,
+        }
+        try:
+            resp = await self._client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 300:
+                logger.warning("Pinto generating status failed: HTTP %s %s", resp.status_code, resp.text)
+        except Exception as e:
+            logger.warning("Pinto generating status failed: %s", e)
 
     def _public_base_url(self) -> str:
         explicit = os.getenv("PINTO_PUBLIC_BASE_URL", "").rstrip("/")
@@ -366,6 +402,7 @@ class PintoAdapter(BasePlatformAdapter):
             if match:
                 return match.group(1)
         return None
+
 
     async def _send_native_chat_message(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
         """Send via Pinto native chat API when PINTO_BEARER_TOKEN is configured."""
@@ -502,6 +539,34 @@ class PintoAdapter(BasePlatformAdapter):
             return uploaded
         return self._media_url_for_file(media_file)
 
+
+    async def _send_receive_media_file(self, chat_id: str, caption: str, file_path: str) -> SendResult:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return SendResult(success=False, error=f"Media file not found: {file_path}")
+        url = f"{self._api_url}{self._receive_media_path}"
+        headers = {}
+        if self._media_upload_secret:
+            headers["X-Pinto-Media-Secret"] = self._media_upload_secret
+        data = {"bot_id": self._bot_id, "chat_id": chat_id}
+        if caption:
+            data["reply_message"] = caption
+        content_type = "image/png"
+        suffix = path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            content_type = "image/jpeg"
+        elif suffix == ".webp":
+            content_type = "image/webp"
+        elif suffix == ".gif":
+            content_type = "image/gif"
+        await self._set_generating(chat_id, False, "image")
+        with path.open("rb") as file_handle:
+            files = {"file": (path.name, file_handle, content_type)}
+            resp = await self._client.post(url, data=data, files=files, headers=headers)
+        if resp.status_code >= 300:
+            return SendResult(success=False, error=f"Pinto media HTTP {resp.status_code}: {resp.text}")
+        return SendResult(success=True, message_id=str(time.time()))
+
     async def _send_webhook_receive(self, chat_id: str, text: str, media_file: Optional[str]) -> SendResult:
         url = f"{self._api_url}/v1/bots/webhook/receive"
         headers = {"Content-Type": "application/json"}
@@ -514,6 +579,8 @@ class PintoAdapter(BasePlatformAdapter):
             "reply_message": text,
         }
         if media_file:
+            if Path(str(media_file)).exists() and Path(str(media_file)).is_file():
+                return await self._send_receive_media_file(chat_id, "", str(media_file))
             media_url = await self._public_url_for_media(media_file)
             if media_url != media_file:
                 if self._send_media_url_field:
@@ -532,11 +599,7 @@ class PintoAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=str(time.time()))
 
     async def send(self, chat_id: str, text: str = "", content: str = "", **kwargs: Any) -> SendResult:
-        """Post reply back to Pinto.
-
-        Uses native chat API with multipart media upload when PINTO_BEARER_TOKEN
-        is set. Otherwise falls back to the bot webhook receive endpoint.
-        """
+        """Post reply back to Pinto."""
         if content and not text:
             text = content
         if not self._client:
@@ -544,30 +607,50 @@ class PintoAdapter(BasePlatformAdapter):
 
         media_file = self._extract_media_file(text, kwargs.get("media_files"))
         try:
+            if media_file:
+                await self._set_generating(chat_id, True, "image")
+            await self._set_generating(chat_id, False, "")
+            image_completion_text = bool(
+                text
+                and not media_file
+                and (
+                    "ภาพสร้างแล้ว" in text
+                    or "รูปสร้างแล้ว" in text
+                    or "image generated" in text.lower()
+                    or "generated image" in text.lower()
+                )
+            )
+            if image_completion_text:
+                logger.warning("Pinto outbound suppress image completion text chat_id=%s text_len=%s", chat_id, len(text or ""))
+                return SendResult(success=True, message_id=str(time.time()))
             if self._bearer_token:
-                return await self._send_native_chat_message(chat_id, text, media_file)
-            return await self._send_webhook_receive(chat_id, text, media_file)
+                result = await self._send_native_chat_message(chat_id, text, media_file)
+            else:
+                result = await self._send_webhook_receive(chat_id, text, media_file)
+            if result.success:
+                logger.warning("Pinto outbound send OK chat_id=%s media=%s text_len=%s", chat_id, bool(media_file), len(text or ""))
+            else:
+                logger.error("Pinto outbound send FAILED chat_id=%s media=%s error=%s", chat_id, bool(media_file), result.error)
+            return result
         except Exception as e:
+            logger.exception("Pinto outbound send exception chat_id=%s media=%s", chat_id, bool(media_file))
             return SendResult(success=False, error=str(e))
+        finally:
+            self._generating_state.pop(chat_id, None)
+            await self._set_generating(chat_id, False, "")
+
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Send a throttled status message while Hermes is processing.
+        """Tell Pinto clients this bot is generating a response.
 
-        Pinto does not currently expose a native typing indicator endpoint to
-        this adapter. If PINTO_TYPING_STATUS_MESSAGE is set, use a lightweight
-        chat message as a fallback and throttle it per chat.
+        Pinto exposes ``POST /v1/bots/webhook/generating`` and broadcasts a
+        ``bot_generating`` websocket event. Hermes calls this while processing;
+        ``send()`` clears the indicator before delivering the final message.
         """
-        if self._bearer_token and self._client:
-            try:
-                await self._client.post(
-                    f"{self._api_url}/v1/chats/typing",
-                    json={"chat_id": chat_id, "is_typing": True},
-                    headers={"Authorization": f"Bearer {self._bearer_token}"},
-                )
-                return
-            except Exception as e:
-                logger.debug("Pinto native typing failed: %s", e)
-
+        generating_type = self._generating_type_default
+        if isinstance(metadata, dict):
+            generating_type = metadata.get("generating_type") or metadata.get("type") or generating_type
+        await self._set_generating(chat_id, True, generating_type)
         if not self._typing_status_message:
             return
         now = time.time()

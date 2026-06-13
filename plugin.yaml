@@ -1,42 +1,28 @@
 name: pinto-platform
 label: Pinto Chat
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   Pinto Chat gateway adapter for Hermes Agent.
-  Allows Hermes to connect to Pinto App Thailand APIs,
-  receiving webhook events and replying directly.
-  Supports both flat (production) and nested (Swagger) webhook payloads.
+  Receives Pinto webhooks, sends replies, generating status, and media uploads.
 author: Theeraphat S
 
 requires_env:
   - name: PINTO_BOT_ID
-    description: "Your Pinto Bot UUID or slug (e.g. hermes_ai)"
+    description: "Bot ID from Pinto Developer Console"
     prompt: "Pinto Bot ID"
     password: false
 
 optional_env:
   - name: PINTO_API_URL
-    description: "Pinto API Endpoint URL (default: https://api.pinto-app.com)"
+    description: "Pinto API URL. Dev: https://api-dev.pinto-app.com, Prod: https://api.pinto-app.com"
     prompt: "Pinto API URL"
     password: false
+  - name: PINTO_WEBHOOK_URL
+    description: "Copy this URL into Pinto Developer Console > Bot Webhook URL"
+    prompt: "Developer Console Webhook URL"
+    password: false
   - name: PINTO_WEBHOOK_SECRET
-    description: "Webhook secret key for verifying inbound payload signatures (optional)"
-    prompt: "Pinto Webhook Secret"
-    password: true
-  - name: PINTO_WEBHOOK_PATH
-    description: "Local route mapping for inbound webhooks (default: /plugins/pinto/webhook)"
-    prompt: "Pinto Webhook Path"
-    password: false
-  - name: PINTO_HOME_CHANNEL
-    description: "Default Chat ID for cron or notification delivery"
-    prompt: "Home channel Chat ID (or empty)"
-    password: false
-  - name: PINTO_ALLOWED_USERS
-    description: "Comma-separated Pinto user IDs allowed to chat (allowlist)"
-    prompt: "Allowed User IDs (comma-separated)"
-    password: false
-  - name: PINTO_ALLOW_ALL_USERS
-    description: "Allow any user to talk to the bot (true/false)"
-    prompt: "Allow all users? (true/false)"
+    description: "Copy this secret into Pinto Developer Console. Generated automatically if blank."
+    prompt: "Developer Console Webhook Secret"
     password: false
