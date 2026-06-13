@@ -22,7 +22,7 @@ Environment variables::
     PINTO_WEBHOOK_URL      – Public webhook URL; used to derive media URLs
     PINTO_PUBLIC_BASE_URL  – Optional public gateway base URL for media
     PINTO_MEDIA_PATH       – Public local-media route (default: /plugins/pinto/media)
-    PINTO_MEDIA_UPLOAD_PROVIDER – Optional free public upload provider: catbox or litterbox
+    PINTO_MEDIA_UPLOAD_PROVIDER – Optional free public upload provider(s): catbox,litterbox,0x0,uguu,tmpfiles
     PINTO_BEARER_TOKEN     – Optional user/service JWT for native chat API testing only
     PINTO_HOME_CHANNEL     – Default chat_id for cron / notification delivery
     PINTO_ALLOWED_USERS    – Comma-separated allowlist of Pinto user IDs
@@ -405,44 +405,87 @@ class PintoAdapter(BasePlatformAdapter):
             return f"{text}\n{media_url}" if text else media_url
         return text
 
-    async def _upload_public_media(self, file_path: str) -> Optional[str]:
-        """Upload local media to a free public host when configured."""
-        if not self._media_upload_provider:
-            return None
-        path = Path(file_path)
-        if not path.exists() or not path.is_file():
-            return None
+    def _upload_providers(self) -> list[str]:
+        raw = self._media_upload_provider
+        if not raw:
+            return []
+        if raw in {"free", "auto", "all"}:
+            return ["catbox", "litterbox", "0x0", "uguu", "tmpfiles"]
+        return [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
 
-        if self._media_upload_provider == "catbox":
+    async def _upload_to_provider(self, provider: str, path: Path) -> Optional[str]:
+        file_field = "fileToUpload"
+        data = None
+        url = ""
+        if provider == "catbox":
             url = "https://catbox.moe/user/api.php"
             data = {"reqtype": "fileupload"}
-        elif self._media_upload_provider == "litterbox":
+        elif provider == "litterbox":
             url = "https://litterbox.catbox.moe/resources/internals/api.php"
             data = {"reqtype": "fileupload", "time": self._litterbox_expiry}
+        elif provider in {"0x0", "0x0.st"}:
+            url = "https://0x0.st"
+            file_field = "file"
+        elif provider == "uguu":
+            url = "https://uguu.se/upload.php"
+            file_field = "files[]"
+        elif provider == "tmpfiles":
+            url = "https://tmpfiles.org/api/v1/upload"
+            file_field = "file"
         else:
-            logger.warning("Unknown PINTO_MEDIA_UPLOAD_PROVIDER=%s", self._media_upload_provider)
+            logger.warning("Unknown Pinto media upload provider=%s", provider)
             return None
 
         file_handle = None
         try:
             file_handle = path.open("rb")
-            files = {"fileToUpload": (path.name, file_handle, "image/png")}
+            files = {file_field: (path.name, file_handle, "image/png")}
             resp = await self._client.post(url, data=data, files=files, timeout=120.0)
             if resp.status_code >= 300:
-                logger.warning("Pinto media upload failed HTTP %s: %s", resp.status_code, resp.text[:300])
+                logger.warning("Pinto media upload %s failed HTTP %s: %s", provider, resp.status_code, resp.text[:300])
                 return None
-            public_url = resp.text.strip()
+
+            text = resp.text.strip()
+            public_url = ""
+            if text.startswith(("http://", "https://")):
+                public_url = text
+            else:
+                try:
+                    body = resp.json()
+                    if provider == "uguu":
+                        files_body = body.get("files") or []
+                        if files_body:
+                            public_url = files_body[0].get("url") or ""
+                    elif provider == "tmpfiles":
+                        public_url = ((body.get("data") or {}).get("url") or "").replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                except Exception:
+                    pass
+
             if public_url.startswith(("http://", "https://")):
-                logger.info("Pinto media uploaded via %s: %s", self._media_upload_provider, public_url)
+                logger.info("Pinto media uploaded via %s: %s", provider, public_url)
                 return public_url
-            logger.warning("Pinto media upload returned non-url response: %s", public_url[:300])
+            logger.warning("Pinto media upload %s returned non-url response: %s", provider, text[:300])
             return None
         except Exception as e:
-            logger.warning("Pinto media upload failed: %s", e)
+            logger.warning("Pinto media upload %s failed: %s", provider, e)
             return None
         finally:
             if file_handle:
                 file_handle.close()
+
+    async def _upload_public_media(self, file_path: str) -> Optional[str]:
+        """Upload local media to configured free public hosts, with fallback."""
+        providers = self._upload_providers()
+        if not providers:
+            return None
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return None
+        for provider in providers:
+            uploaded = await self._upload_to_provider(provider, path)
+            if uploaded:
+                return uploaded
+        return None
 
     async def _public_url_for_media(self, media_file: str) -> str:
         if media_file.startswith(("http://", "https://")):
