@@ -133,6 +133,9 @@ class PintoAdapter(BasePlatformAdapter):
             "PINTO_MEDIA_PATH", "/plugins/pinto/media"
         )
         self._media_files: dict[str, str] = {}
+        self._typing_last_sent: dict[str, float] = {}
+        self._typing_status_message = os.getenv("PINTO_TYPING_STATUS_MESSAGE", "")
+        self._typing_status_interval = float(os.getenv("PINTO_TYPING_STATUS_INTERVAL", "20"))
         self._client: Optional["_httpx.AsyncClient"] = None
 
     # -- lifecycle -----------------------------------------------------------
@@ -375,8 +378,21 @@ class PintoAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
-    async def send_typing(self, chat_id: str) -> None:
-        pass  # Pinto has no typing indicator API
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Send a throttled status message while Hermes is processing.
+
+        Pinto does not currently expose a native typing indicator endpoint to
+        this adapter. If PINTO_TYPING_STATUS_MESSAGE is set, use a lightweight
+        chat message as a fallback and throttle it per chat.
+        """
+        if not self._typing_status_message:
+            return
+        now = time.time()
+        last = self._typing_last_sent.get(chat_id, 0)
+        if now - last < self._typing_status_interval:
+            return
+        self._typing_last_sent[chat_id] = now
+        await self.send(chat_id, self._typing_status_message)
 
     async def send_image(self, chat_id: str, image_url: str, caption: str) -> SendResult:
         return await self.send(chat_id, caption, media_files=[image_url])
