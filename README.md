@@ -55,6 +55,11 @@ platforms:
       apiUrl: https://api.pinto-app.com
       webhookSecret: your-secret-key
       webhookPath: /plugins/pinto/webhook
+      bots:
+        another-bot-id:
+          name: Poem Bot
+          channelPrompt: |
+            You are a poet. Reply in polished Thai verse when appropriate.
 ```
 
 หรือใช้ environment variables ใน `~/.hermes/.env` เป็น fallback/standalone setup:
@@ -148,6 +153,11 @@ platforms:
       apiUrl: https://api.pinto-app.com
       webhookSecret: your-secret-key
       webhookPath: /plugins/pinto/webhook
+      bots:
+        another-bot-id:
+          name: Poem Bot
+          channelPrompt: |
+            You are a poet. Reply in polished Thai verse when appropriate.
 ```
 
 Or use environment variables in `~/.hermes/.env` as a fallback/standalone setup:

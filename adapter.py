@@ -12,6 +12,10 @@ Configuration via config.yaml, with environment variables as fallback::
           botId: "your-bot-uuid"
           webhookSecret: "your-optional-secret"
           webhookPath: "/plugins/pinto/webhook"
+          bots:
+            another-bot-id:
+              name: "Poem Bot"
+              channelPrompt: "You are a poet. Reply in polished Thai verse when appropriate."
 
 Environment variables::
 
@@ -95,7 +99,8 @@ def check_requirements() -> bool:
 def validate_config(config: PlatformConfig) -> bool:
     extra = getattr(config, "extra", {}) or {}
     bot_id = extra.get("botId") or os.getenv("PINTO_BOT_ID")
-    return bool(bot_id)
+    bots = extra.get("bots") if isinstance(extra.get("bots"), dict) else {}
+    return bool(bot_id or bots)
 
 
 def is_connected(config: PlatformConfig) -> bool:
@@ -124,6 +129,8 @@ class PintoAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         extra = getattr(config, "extra", {}) or {}
         self._bot_id = extra.get("botId") or os.getenv("PINTO_BOT_ID")
+        self._bot_configs = extra.get("bots") if isinstance(extra.get("bots"), dict) else {}
+        self._active_bot_by_chat: dict[str, str] = {}
         self._api_url = (
             extra.get("apiUrl") or os.getenv("PINTO_API_URL", DEFAULT_PINTO_API_URL)
         ).rstrip("/")
@@ -155,8 +162,8 @@ class PintoAdapter(BasePlatformAdapter):
     # -- lifecycle -----------------------------------------------------------
 
     async def connect(self) -> bool:
-        if not self._bot_id:
-            logger.error("PINTO_BOT_ID not configured")
+        if not self._bot_id and not self._bot_configs:
+            logger.error("Pinto botId not configured")
             return False
 
         self._client = httpx.AsyncClient(timeout=30.0)
@@ -195,7 +202,11 @@ class PintoAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Failed to register Pinto webhook route: %s", e)
 
-        logger.info("Pinto Chat adapter connected (bot_id=%s)", self._bot_id)
+        logger.info(
+            "Pinto Chat adapter connected (primary_bot_id=%s, extra_bots=%s)",
+            self._bot_id,
+            len(self._bot_configs),
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -276,7 +287,8 @@ class PintoAdapter(BasePlatformAdapter):
                     content_type="application/json",
                 )
 
-            if bot_id != self._bot_id:
+            bot_config = self._bot_config(bot_id)
+            if bot_config is None:
                 return request.app["response_class"](
                     status=403,
                     text=json.dumps({
@@ -291,6 +303,8 @@ class PintoAdapter(BasePlatformAdapter):
                     }),
                     content_type="application/json",
                 )
+            self._active_bot_by_chat[str(chat_id)] = str(bot_id)
+            channel_prompt = self._bot_channel_prompt(bot_config)
 
             source = SessionSource(
                 platform=self.platform,
@@ -304,6 +318,7 @@ class PintoAdapter(BasePlatformAdapter):
                 source=source,
                 message_id=str(uuid.uuid4()),
                 raw_message=body,
+                channel_prompt=channel_prompt,
             )
 
             task = asyncio.create_task(self.handle_message(event))
@@ -327,11 +342,32 @@ class PintoAdapter(BasePlatformAdapter):
                 content_type="application/json",
             )
 
+    def _bot_config(self, bot_id: str) -> Optional[dict]:
+        if self._bot_id and bot_id == self._bot_id:
+            return {}
+        cfg = self._bot_configs.get(bot_id)
+        if isinstance(cfg, dict):
+            return cfg
+        return None
+
+    def _bot_channel_prompt(self, bot_config: dict) -> Optional[str]:
+        prompt = bot_config.get("channelPrompt") or bot_config.get("prompt")
+        role = bot_config.get("role") or bot_config.get("name")
+        if prompt:
+            return str(prompt).strip()
+        if role:
+            return f"You are {role}. Stay in this role for this chat."
+        return None
+
+    def _bot_id_for_chat(self, chat_id: str) -> str:
+        return self._active_bot_by_chat.get(str(chat_id), self._bot_id or "")
+
     # -- local media ---------------------------------------------------------
 
 
     async def _set_generating(self, chat_id: str, is_generating: bool, generating_type: str = "text") -> None:
-        if not self._client or not self._bot_id:
+        bot_id = self._bot_id_for_chat(chat_id)
+        if not self._client or not bot_id:
             return
         generating_type = (generating_type or self._generating_type_default or "text") if is_generating else ""
         state = (is_generating, generating_type)
@@ -343,7 +379,7 @@ class PintoAdapter(BasePlatformAdapter):
         if self._generating_secret:
             headers[PINTO_SECRET_HEADER] = self._generating_secret
         payload = {
-            "bot_id": self._bot_id,
+            "bot_id": bot_id,
             "chat_id": chat_id,
             "is_generating": is_generating,
             "generating_type": generating_type,
@@ -566,7 +602,7 @@ class PintoAdapter(BasePlatformAdapter):
         headers = {}
         if self._media_upload_secret:
             headers["X-Pinto-Media-Secret"] = self._media_upload_secret
-        data = {"bot_id": self._bot_id, "chat_id": chat_id}
+        data = {"bot_id": self._bot_id_for_chat(chat_id), "chat_id": chat_id}
         if caption:
             data["reply_message"] = caption
         content_type = "image/png"
@@ -592,7 +628,7 @@ class PintoAdapter(BasePlatformAdapter):
             headers[PINTO_SECRET_HEADER] = self._webhook_secret
 
         payload = {
-            "bot_id": self._bot_id,
+            "bot_id": self._bot_id_for_chat(chat_id),
             "chat_id": chat_id,
             "reply_message": text,
         }
