@@ -2,7 +2,7 @@
 
 Allows Hermes Agent to act as a chat bot gateway on Pinto.
 
-Configuration via environment variables or config.yaml::
+Configuration via config.yaml, with environment variables as fallback::
 
     platforms:
       pinto:
@@ -15,7 +15,7 @@ Configuration via environment variables or config.yaml::
 
 Environment variables::
 
-    PINTO_BOT_ID           – Required. Your Pinto Bot UUID or slug (e.g. "hermes_ai")
+    PINTO_BOT_ID           – Fallback Bot UUID/slug when config.yaml has no platforms.pinto.extra.botId
     PINTO_API_URL          – API base URL (default: https://api.pinto-app.com)
     PINTO_WEBHOOK_SECRET   – Optional secret for X-Pinto-Secret header verification
     PINTO_WEBHOOK_PATH     – Local webhook route (default: /plugins/pinto/webhook)
@@ -75,7 +75,7 @@ PINTO_SECRET_HEADER = "x-pinto-secret"
 # ---------------------------------------------------------------------------
 
 def _env_enablement() -> Optional[dict]:
-    """Auto-enable platform when PINTO_BOT_ID is present in environment."""
+    """Auto-enable platform from PINTO_BOT_ID only as a config fallback."""
     bot_id = os.getenv("PINTO_BOT_ID")
     if not bot_id:
         return None

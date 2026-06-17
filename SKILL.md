@@ -18,15 +18,27 @@
 18|curl -sL https://raw.githubusercontent.com/fakduai-logistics-and-digital-platform/pinto-adapter-hermes/main/__init__.py -o ~/.hermes/plugins/platforms/pinto/__init__.py
 19|```
 20|
-21|## Required environment variables
+21|## Bot ID config
 22|
-23|Add these to your `~/.hermes/.env` file:
+23|Preferred durable config in `~/.hermes/config.yaml`:
 24|
-25|```env
-26|PINTO_BOT_ID=your-bot-id-here
-27|```
-28|
-29|## Optional environment variables
+25|```yaml
+26|platforms:
+27|  pinto:
+28|    enabled: true
+29|    extra:
+30|      botId: your-bot-id-here
+31|```
+32|
+33|Fallback/standalone setup in `~/.hermes/.env`:
+34|
+35|```env
+36|PINTO_BOT_ID=your-bot-id-here
+37|```
+38|
+39|If both exist, keep `config.yaml` as source of truth and treat `PINTO_BOT_ID` as fallback.
+40|
+41|## Optional environment variables
 30|
 31|```env
 32|PINTO_API_URL=https://api.pinto-app.com

@@ -44,10 +44,23 @@ pip install httpx
 
 ### ตั้งค่า
 
-เพิ่ม environment variables ในไฟล์ `~/.hermes/.env`:
+ตั้งค่าแนะนำแบบถาวรใน `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  pinto:
+    enabled: true
+    extra:
+      botId: your-pinto-bot-id
+      apiUrl: https://api.pinto-app.com
+      webhookSecret: your-secret-key
+      webhookPath: /plugins/pinto/webhook
+```
+
+หรือใช้ environment variables ใน `~/.hermes/.env` เป็น fallback/standalone setup:
 
 ```env
-PINTO_BOT_ID=hermes_ai
+PINTO_BOT_ID=your-pinto-bot-id
 PINTO_API_URL=https://api.pinto-app.com
 PINTO_WEBHOOK_SECRET=your-secret-key
 PINTO_WEBHOOK_PATH=/plugins/pinto/webhook
@@ -56,11 +69,13 @@ PINTO_ALLOWED_USERS=user-id-1,user-id-2
 PINTO_ALLOW_ALL_USERS=true
 ```
 
+ถ้า `config.yaml` มี `platforms.pinto.extra.botId` แล้ว ให้ถือค่านั้นเป็นค่าหลัก; `PINTO_BOT_ID` เป็น fallback ตอน config ยังไม่มี botId เท่านั้น.
+
 #### Environment variables
 
 | Variable                | Required | Description                                       |
 | ----------------------- | -------: | ------------------------------------------------- |
-| `PINTO_BOT_ID`          |      Yes | Bot ID ที่ใช้ระบุตัวตนของบอท                      |
+| `PINTO_BOT_ID`          |       No | fallback Bot ID เมื่อ `config.yaml` ยังไม่มี botId |
 | `PINTO_API_URL`         |       No | Base URL ของ Pinto API                            |
 | `PINTO_WEBHOOK_SECRET`  |       No | Secret สำหรับตรวจสอบ webhook                      |
 | `PINTO_WEBHOOK_PATH`    |       No | Path สำหรับรับ webhook                            |
@@ -122,10 +137,23 @@ pip install httpx
 
 ### Configure
 
-Add the following environment variables to `~/.hermes/.env`:
+Recommended persistent config in `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  pinto:
+    enabled: true
+    extra:
+      botId: your-pinto-bot-id
+      apiUrl: https://api.pinto-app.com
+      webhookSecret: your-secret-key
+      webhookPath: /plugins/pinto/webhook
+```
+
+Or use environment variables in `~/.hermes/.env` as a fallback/standalone setup:
 
 ```env
-PINTO_BOT_ID=hermes_ai
+PINTO_BOT_ID=your-pinto-bot-id
 PINTO_API_URL=https://api.pinto-app.com
 PINTO_WEBHOOK_SECRET=your-secret-key
 PINTO_WEBHOOK_PATH=/plugins/pinto/webhook
@@ -134,17 +162,19 @@ PINTO_ALLOWED_USERS=user-id-1,user-id-2
 PINTO_ALLOW_ALL_USERS=true
 ```
 
+If `config.yaml` already has `platforms.pinto.extra.botId`, treat that value as primary; `PINTO_BOT_ID` is only a fallback when config has no botId yet.
+
 #### Environment variables
 
-| Variable                | Required | Description                               |
-| ----------------------- | -------: | ----------------------------------------- |
-| `PINTO_BOT_ID`          |      Yes | Bot ID used to identify the Pinto bot     |
-| `PINTO_API_URL`         |       No | Pinto API base URL                        |
-| `PINTO_WEBHOOK_SECRET`  |       No | Secret used to validate webhook requests  |
-| `PINTO_WEBHOOK_PATH`    |       No | Webhook path used by the adapter          |
-| `PINTO_HOME_CHANNEL`    |       No | Chat ID for cron or scheduled messages    |
-| `PINTO_ALLOWED_USERS`   |       No | Comma-separated list of allowed user IDs  |
-| `PINTO_ALLOW_ALL_USERS` |       No | Allows all users to interact with the bot |
+| Variable                | Required | Description                                        |
+| ----------------------- | -------: | -------------------------------------------------- |
+| `PINTO_BOT_ID`          |       No | fallback Bot ID when `config.yaml` has no botId    |
+| `PINTO_API_URL`         |       No | Pinto API base URL                                 |
+| `PINTO_WEBHOOK_SECRET`  |       No | Secret used to validate webhook requests           |
+| `PINTO_WEBHOOK_PATH`    |       No | Webhook path used by the adapter                   |
+| `PINTO_HOME_CHANNEL`    |       No | Chat ID for cron or scheduled messages             |
+| `PINTO_ALLOWED_USERS`   |       No | Comma-separated list of allowed user IDs           |
+| `PINTO_ALLOW_ALL_USERS` |       No | Allows all users to interact with the bot          |
 
 ---
 
